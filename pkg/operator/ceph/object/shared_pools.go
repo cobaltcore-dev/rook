@@ -13,14 +13,14 @@ import (
 )
 
 const (
-	defaultPlacementName           = "default"
+	// defaultPlacementName           = "default"
 	defaultPlacementCephConfigName = "default-placement"
 	defaultPlacementStorageClass   = "STANDARD"
 )
 
 func IsNeedToCreateObjectStorePools(sharedPools cephv1.ObjectSharedPoolsSpec) bool {
 	for _, pp := range sharedPools.PoolPlacements {
-		if pp.Name == defaultPlacementName {
+		if pp.IsDefault {
 			// No need to create pools. External pools from default placement will be used
 			return false
 		}
@@ -33,8 +33,14 @@ func IsNeedToCreateObjectStorePools(sharedPools cephv1.ObjectSharedPoolsSpec) bo
 }
 
 func validatePoolPlacements(placements []cephv1.PoolPlacementSpec) error {
+	hasDefault := false
 	names := make(map[string]struct{}, len(placements))
 	for _, p := range placements {
+		if hasDefault && p.IsDefault {
+			return fmt.Errorf("invalidObjStorePoolCofig: only one placement can be set as default")
+		}
+		hasDefault = hasDefault || p.IsDefault
+
 		if _, ok := names[p.Name]; ok {
 			return fmt.Errorf("invalidObjStorePoolCofig: invalid placement %s: placement names must be unique", p.Name)
 		}
@@ -79,6 +85,7 @@ func adjustZonePlacementPools(zone map[string]interface{}, spec cephv1.ObjectSha
 
 	fromSpec := toZonePlacementPools(spec, name)
 
+	defaultPlacementName := getDefaultPlacementName(spec)
 	inConfig := map[string]struct{}{}
 	idxToRemove := map[int]struct{}{}
 	for i, p := range placements {
@@ -91,7 +98,7 @@ func adjustZonePlacementPools(zone map[string]interface{}, spec cephv1.ObjectSha
 			return nil, fmt.Errorf("unable to get pool placement name for zone %s: %w", name, err)
 		}
 		// check if placement should be removed
-		if _, inSpec := fromSpec[placementID]; !inSpec && placementID != defaultPlacementCephConfigName {
+		if _, inSpec := fromSpec[placementID]; !inSpec && placementID != defaultPlacementName {
 			// remove placement if it is not in spec, but don't remove default placement
 			idxToRemove[i] = struct{}{}
 			continue
@@ -151,9 +158,18 @@ func adjustZonePlacementPools(zone map[string]interface{}, spec cephv1.ObjectSha
 	return zone, nil
 }
 
+func getDefaultPlacementName(spec cephv1.ObjectSharedPoolsSpec) string {
+	for _, p := range spec.PoolPlacements {
+		if p.IsDefault {
+			return p.Name
+		}
+	}
+	return defaultPlacementCephConfigName
+}
+
 func getDefaultMetadataPool(spec cephv1.ObjectSharedPoolsSpec) string {
 	for _, p := range spec.PoolPlacements {
-		if p.Name == defaultPlacementName {
+		if p.IsDefault {
 			return p.MetadataPoolName
 		}
 	}
@@ -165,12 +181,10 @@ func toZonePlacementPools(spec cephv1.ObjectSharedPoolsSpec, ns string) map[stri
 	hasDefault := false
 	res := make(map[string]ZonePlacementPool, len(spec.PoolPlacements)+1)
 	for _, pp := range spec.PoolPlacements {
-		name := pp.Name
-		if pp.Name == defaultPlacementName {
+		if pp.IsDefault {
 			hasDefault = true
-			name = defaultPlacementCephConfigName
 		}
-		res[name] = toZonePlacementPool(pp, ns)
+		res[pp.Name] = toZonePlacementPool(pp, ns)
 	}
 	if !hasDefault && spec.DataPoolName != "" && spec.MetadataPoolName != "" {
 		// set shared pools as default if no default placement was provided
@@ -197,10 +211,7 @@ func toZonePlacementPools(spec cephv1.ObjectSharedPoolsSpec, ns string) map[stri
 }
 
 func toZonePlacementPool(spec cephv1.PoolPlacementSpec, ns string) ZonePlacementPool {
-	placementNS := ns
-	if spec.Name != defaultPlacementName {
-		placementNS += "." + spec.Name
-	}
+	placementNS := ns + "." + spec.Name
 	// The extra pool is for omap data for multi-part uploads, so we use
 	// the metadata pool instead of the data pool.
 	nonECPool := spec.MetadataPoolName + ":" + placementNS + ".data.non-ec"
@@ -218,14 +229,11 @@ func toZonePlacementPool(spec cephv1.PoolPlacementSpec, ns string) ZonePlacement
 					DataPool: spec.DataPoolName + ":" + placementNS + ".data",
 				},
 			},
-			// Workaround: radosgw-admin set zone json command sets incorrect default value for placement inline_data field.
+			// Workaround: 'radosgw-admin set zone json' command sets incorrect default value for placement inline_data field.
 			// So we should set default value (true) explicitly.
 			// See: https://tracker.ceph.com/issues/67933
 			InlineData: true,
 		},
-	}
-	if res.Key == defaultPlacementName {
-		res.Key = defaultPlacementCephConfigName
 	}
 	for _, v := range spec.StorageClasses {
 		res.Val.StorageClasses[v.Name] = ZonePlacementStorageClass{
@@ -235,7 +243,7 @@ func toZonePlacementPool(spec cephv1.PoolPlacementSpec, ns string) ZonePlacement
 	return res
 }
 
-func adjustZoneGroupPlacementTargets(group, zone map[string]interface{}) (map[string]interface{}, error) {
+func adjustZoneGroupPlacementTargets(group, zone map[string]interface{}, defaultPlacement string) (map[string]interface{}, error) {
 	name, err := getObjProperty[string](group, "name")
 	if err != nil {
 		return nil, fmt.Errorf("unable to get zonegroup name: %w", err)
@@ -247,7 +255,7 @@ func adjustZoneGroupPlacementTargets(group, zone map[string]interface{}) (map[st
 		return nil, fmt.Errorf("unable to deep copy config for zonegroup %s: %w", name, err)
 	}
 
-	_, err = setObjProperty(group, defaultPlacementCephConfigName, "default_placement")
+	_, err = setObjProperty(group, defaultPlacement, "default_placement")
 	if err != nil {
 		return nil, fmt.Errorf("unable to set default_placement for zonegroup %s: %w", name, err)
 	}

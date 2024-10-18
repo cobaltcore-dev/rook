@@ -800,7 +800,8 @@ func ConfigureSharedPoolsForZone(objContext *Context, sharedPools cephv1.ObjectS
 	if err != nil {
 		return err
 	}
-	zoneGroupUpdated, err := adjustZoneGroupPlacementTargets(zoneGroupConfig, zoneUpdated)
+	defaultPlacement := getDefaultPlacementName(sharedPools)
+	zoneGroupUpdated, err := adjustZoneGroupPlacementTargets(zoneGroupConfig, zoneUpdated, defaultPlacement)
 	if err != nil {
 		return err
 	}

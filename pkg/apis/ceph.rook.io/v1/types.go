@@ -1563,6 +1563,9 @@ type PoolPlacementSpec struct {
 	// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9._/-]+$`
 	Name string `json:"name"`
 
+	// Sets given placement as default.
+	IsDefault bool `json:"isDefault"`
+
 	// The metadata pool used to store ObjectStore bucket index.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
