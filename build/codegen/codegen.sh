@@ -35,17 +35,35 @@ if [ ! -d "$output_base/$apis_pkg" ]; then
   exit 1
 fi
 
-echo "Generate code for packages: 
-  - $(toAbsolutePath $output_base/$output_pkg)
-  - $(toAbsolutePath $output_base/$apis_pkg)"
-
 # CODE GENERATION
 # we run deepcopy and client,lister,informer generations separately so we can use the flag "--plural-exceptions"
 # which is only known by client,lister,informer binary and not the deepcopy binary
+source ${CODE_GENERATOR}/kube_codegen.sh
+
+echo "Generate deepcopy for packages: 
+  - $(toAbsolutePath $output_base/$apis_pkg)"
+# run code deepcopy generation
+kube::codegen::gen_helpers \
+    "$scriptdir/../../pkg/apis" \
+    --boilerplate "${scriptdir}/boilerplate.go.txt"
+
+echo "Generate clients for packages: 
+  - $(toAbsolutePath $output_base/$output_pkg)"
+# run code client,lister,informer generation
+kube::codegen::gen_client \
+    "$scriptdir/../../pkg/apis" \
+    --output-dir $(toAbsolutePath $output_base/$output_pkg) \
+    --output-pkg $output_pkg \
+    --boilerplate "${scriptdir}/boilerplate.go.txt" \
+    --plural-exceptions "CephNFS:CephNFSes" 
+
+#     --applyconfig-externals "${GROUP_VERSIONS}" \
+
 
 # run code deepcopy generation
-bash ${CODE_GENERATOR}/generate-groups.sh \
-    deepcopy \
+exit 0
+bash ${CODE_GENERATOR}/kube_codegen.sh \
+    kube::codegen::gen_helpers \
     $output_pkg \
     $apis_pkg \
     "${GROUP_VERSIONS}" \
