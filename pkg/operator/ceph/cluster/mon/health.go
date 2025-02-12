@@ -20,11 +20,13 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	"github.com/rook/rook/pkg/daemon/ceph/client"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	cephutil "github.com/rook/rook/pkg/daemon/ceph/util"
 	"github.com/rook/rook/pkg/operator/ceph/config"
@@ -202,14 +204,53 @@ func (c *Cluster) checkHealth(ctx context.Context) error {
 	}
 	logger.Debugf("Mon quorum status: %+v", quorumStatus)
 
+	// handle external arbiter monitors if configured in cluser CRD:
+	extMonsInQuorum := 0
+	extMonsChanged := false
+	logger.Debugf("external arbiter mon IDs: %v", c.spec.Mon.ExternalMonIDs)
+	for _, extID := range c.spec.Mon.ExternalMonIDs {
+		monStatus, inQuorum := getMonByID(extID, quorumStatus)
+		if inQuorum {
+			extMonsInQuorum++
+			logger.Debugf("external arbiter mon %q in quorum", extID)
+		} else {
+			logger.Debugf("external arbiter mon %q not in quorum %+v, %+v", extID, quorumStatus.Quorum, quorumStatus.MonMap.Mons)
+		}
+		_, inInfo := c.ClusterInfo.Monitors[extID]
+		if inQuorum && !inInfo {
+			// add newly discovered external mon to cluster info:
+			monInfo := monStatusToInfo(monStatus)
+			monInfo.ExternalArbiter = true
+			c.ClusterInfo.Monitors[extID] = monInfo
+			extMonsChanged = true
+			logger.Infof("new external arbiter mon %q found: %s, adding it", extID, monInfo.Endpoint)
+		} else if !inQuorum && inInfo {
+			// remove external mon from cluster info if it is out of quorum:
+			delete(c.ClusterInfo.Monitors, extID)
+			extMonsChanged = true
+			logger.Infof("new external arbiter mon %q not in quorum: removing it", extID)
+		}
+	}
+	if extMonsChanged {
+		// update config if external mon was removed or added:
+		if err := c.saveMonConfig(); err != nil {
+			return errors.Wrap(err, "failed to save mon config after adding/removing external arbiter mon")
+		}
+	}
+
 	// Use a local mon count in case the user updates the crd in another goroutine.
 	// We need to complete a health check with a consistent value.
 	desiredMonCount := c.spec.Mon.Count
-	logger.Debugf("targeting the mon count %d", desiredMonCount)
+	logger.Debugf("targeting the mon count %d not including %d external arbiter mons", desiredMonCount, extMonsInQuorum)
+	// external monts are not incuded to desired count:
+	desiredMonCount += extMonsInQuorum
 
 	// Source of truth of which mons should exist is our *clusterInfo*
 	monsNotFound := map[string]interface{}{}
 	for _, mon := range c.ClusterInfo.Monitors {
+		if mon.ExternalArbiter {
+			continue
+		}
 		monsNotFound[mon.Name] = struct{}{}
 	}
 
@@ -217,6 +258,9 @@ func (c *Cluster) checkHealth(ctx context.Context) error {
 	// failover the unhealthy mons
 	allMonsInQuorum := true
 	for _, mon := range quorumStatus.MonMap.Mons {
+		if monInfo, ok := c.ClusterInfo.Monitors[mon.Name]; ok && monInfo.ExternalArbiter {
+			continue
+		}
 		inQuorum := monInQuorum(mon, quorumStatus.Quorum)
 		// if the mon is in quorum remove it from our check for "existence"
 		// else see below condition
@@ -251,6 +295,9 @@ func (c *Cluster) checkHealth(ctx context.Context) error {
 				delete(c.monTimeoutList, mon.Name)
 				logger.Infof("mon %q is back in quorum, removed from mon out timeout list", mon.Name)
 			}
+			continue
+		} else if slices.Contains(c.spec.Mon.ExternalMonIDs, mon.Name) {
+			logger.Infof("ignore external arbiter mon %q being out of quorum", mon.Name)
 			continue
 		}
 
@@ -352,6 +399,9 @@ func (c *Cluster) checkHealth(ctx context.Context) error {
 	// failover mon if `multiClusterService` is enabled but mon service is not exported
 	if allMonsInQuorum && c.spec.Network.MultiClusterService.Enabled {
 		for _, mon := range c.ClusterInfo.Monitors {
+			if mon.ExternalArbiter {
+				continue
+			}
 			monResourceName := resourceName(mon.Name)
 			isAlreadyExported, err := k8sutil.IsServiceExported(c.ClusterInfo.Context, c.context, monResourceName, c.ClusterInfo.Namespace)
 			if err != nil {
@@ -383,6 +433,9 @@ func (c *Cluster) trackMonInOrOutOfQuorum(monName string, inQuorum bool) (bool, 
 	if monName == "" {
 		// All mons are in quorum, so make sure no mons are marked out of quorum
 		for monName, mon := range c.ClusterInfo.Monitors {
+			if mon.ExternalArbiter {
+				continue
+			}
 			if mon.OutOfQuorum {
 				logger.Infof("resetting mon %q to be back in quorum", monName)
 				mon.OutOfQuorum = false
@@ -445,6 +498,10 @@ func (c *Cluster) determineExtraMonToRemove() string {
 	nodesWithMons := map[string]string{}
 	arbitraryMon := ""
 	for _, mon := range mons {
+		// ignore external arbiter mon:
+		if mon.ExternalArbiter {
+			continue
+		}
 		if mon.NodeName == "" {
 			logger.Debugf("mon %q is not scheduled to a specific host", mon.DaemonName)
 			arbitraryMon = mon.DaemonName
@@ -709,6 +766,7 @@ func (c *Cluster) removeMonWithOptionalQuorum(daemonName string, shouldRemoveFro
 		logger.Info("did not identify a mon to remove")
 		return nil
 	}
+
 	logger.Infof("ensuring removal of unhealthy monitor %s", daemonName)
 
 	// Remove the bad monitor from quorum
@@ -831,17 +889,9 @@ func (c *Cluster) addOrRemoveExternalMonitor(status cephclient.MonStatusResponse
 		if _, ok := oldClusterInfoMonitors[mon.Name]; !ok {
 			// If the mon is part of the quorum
 			if inQuorum {
-				// let's add it to ClusterInfo
-				// FYI mon.PublicAddr is "10.97.171.131:6789/0"
-				// so we need to remove '/0'
-				endpointSlash := strings.Split(mon.PublicAddr, "/")
-				endpoint := endpointSlash[0]
-
-				// find IP and Port of that Mon
-				monIP := cephutil.GetIPFromEndpoint(endpoint)
-				monPort := cephutil.GetPortFromEndpoint(endpoint)
-				logger.Infof("new external mon %q found: %s, adding it", mon.Name, endpoint)
-				c.ClusterInfo.Monitors[mon.Name] = cephclient.NewMonInfo(mon.Name, monIP, monPort)
+				info := monStatusToInfo(mon)
+				logger.Infof("new external mon %q found: %s, adding it", mon.Name, info.Endpoint)
+				c.ClusterInfo.Monitors[mon.Name] = info
 			} else {
 				logger.Debugf("mon %q is not in quorum and not in ClusterInfo", mon.Name)
 			}
@@ -877,6 +927,19 @@ func (c *Cluster) addOrRemoveExternalMonitor(status cephclient.MonStatusResponse
 
 	logger.Debugf("ClusterInfo.Monitors is %+v", c.ClusterInfo.Monitors)
 	return changed, nil
+}
+
+func monStatusToInfo(mon client.MonMapEntry) *cephclient.MonInfo {
+	// let's add it to ClusterInfo
+	// FYI mon.PublicAddr is "10.97.171.131:6789/0"
+	// so we need to remove '/0'
+	endpointSlash := strings.Split(mon.PublicAddr, "/")
+	endpoint := endpointSlash[0]
+
+	// find IP and Port of that Mon
+	monIP := cephutil.GetIPFromEndpoint(endpoint)
+	monPort := cephutil.GetPortFromEndpoint(endpoint)
+	return cephclient.NewMonInfo(mon.Name, monIP, monPort)
 }
 
 func (c *Cluster) evictMonIfMultipleOnSameNode() error {

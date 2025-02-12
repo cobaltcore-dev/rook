@@ -65,6 +65,8 @@ type MonInfo struct {
 	Endpoint string `json:"endpoint"`
 	// Whether detected out of quorum by rook. May be different from actual ceph quorum.
 	OutOfQuorum bool `json:"outOfQuorum"`
+	// True if given monitor is external to Rook cluster and should not be managed by Rook.
+	ExternalArbiter bool `json:"externalArbiter,omitempty"`
 }
 
 // CephCred represents the Ceph cluster username and key used by the operator.

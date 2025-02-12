@@ -142,6 +142,8 @@ type monConfig struct {
 	// from the cephcluster host network setting. If the cluster setting changes,
 	// each individual mon must keep running with the same network settings.
 	UseHostNetwork bool
+
+	ExternalArbiter bool
 }
 
 type SchedulingResult struct {
@@ -530,6 +532,7 @@ func (c *Cluster) initClusterInfo(cephVersion cephver.CephVersion, clusterName s
 func (c *Cluster) initMonConfig(size int) (int, []*monConfig, error) {
 
 	// initialize the mon pod info for mons that have been previously created
+	//todo: is it source of truth of mons????
 	mons := c.clusterInfoToMonConfig()
 
 	// initialize mon info if we don't have enough mons (at first startup)
@@ -561,6 +564,16 @@ func (c *Cluster) clusterInfoToMonConfigWithExclude(excludedMon string) []*monCo
 		var nodeName string
 		isHostNetwork := false
 		monPublicIP := cephutil.GetIPFromEndpoint(monitor.Endpoint)
+		if monitor.ExternalArbiter {
+			mons = append(mons, &monConfig{
+				DaemonName:      monitor.Name,
+				Port:            cephutil.GetPortFromEndpoint(monitor.Endpoint),
+				PublicIP:        monPublicIP,
+				ExternalArbiter: true,
+			})
+			continue
+		}
+
 		schedule := c.mapping.Schedule[monitor.Name]
 		if schedule != nil {
 			zone = schedule.Zone
@@ -831,7 +844,9 @@ func (c *Cluster) initMonIPs(mons []*monConfig) error {
 				}
 			}
 		}
-		c.ClusterInfo.Monitors[m.DaemonName] = cephclient.NewMonInfo(m.DaemonName, m.PublicIP, m.Port)
+		info := cephclient.NewMonInfo(m.DaemonName, m.PublicIP, m.Port)
+		info.ExternalArbiter = m.ExternalArbiter
+		c.ClusterInfo.Monitors[m.DaemonName] = info
 	}
 
 	return nil
@@ -882,6 +897,9 @@ func (c *Cluster) assignMons(mons []*monConfig) error {
 	for _, mon := range mons {
 		if c.ClusterInfo.Context.Err() != nil {
 			return c.ClusterInfo.Context.Err()
+		}
+		if mon.ExternalArbiter {
+			continue
 		}
 		// scheduling for this monitor has already been completed
 		if _, ok := c.mapping.Schedule[mon.DaemonName]; ok {
@@ -1011,7 +1029,14 @@ func (c *Cluster) startDeployments(mons []*monConfig, requireAllInQuorum bool) e
 			readyReplicas++
 		}
 	}
-	if len(deployments.Items) < len(mons) {
+	externalArbiters := 0
+	for _, mon := range mons {
+		if mon.ExternalArbiter {
+			externalArbiters++
+		}
+	}
+
+	if len(deployments.Items) < len(mons)-externalArbiters {
 		logger.Infof("%d of %d expected mon deployments exist. creating new deployment(s).", len(deployments.Items), len(mons))
 		onlyCheckQuorumOnce = true
 	} else if readyReplicas == 0 {
@@ -1021,6 +1046,9 @@ func (c *Cluster) startDeployments(mons []*monConfig, requireAllInQuorum bool) e
 
 	// Ensure each of the mons have been created. If already created, it will be a no-op.
 	for i := 0; i < len(mons); i++ {
+		if mons[i].ExternalArbiter {
+			continue
+		}
 		schedule := c.mapping.Schedule[mons[i].DaemonName]
 		err := c.startMon(mons[i], schedule)
 		if err != nil {
@@ -1068,15 +1096,21 @@ func (c *Cluster) startDeployments(mons []*monConfig, requireAllInQuorum bool) e
 }
 
 func (c *Cluster) checkForExtraMonResources(mons []*monConfig, deployments []apps.Deployment) string {
+	externalArbiters := 0
+	for _, mon := range mons {
+		if mon.ExternalArbiter {
+			externalArbiters++
+		}
+	}
 	// If there are fewer mon deployments than the desired count, no need to remove an extra.
-	if len(deployments) <= c.spec.Mon.Count || len(deployments) <= len(mons) {
+	if len(deployments) <= c.spec.Mon.Count || len(deployments) <= len(mons)-externalArbiters {
 		logger.Debug("no extra mon deployments to remove")
 		return ""
 	}
 	// If there are fewer mons in the list than expected, either new mons are being created for
 	// a new cluster, or a mon failover is in progress and the list of mons only
 	// includes the single mon that was just started
-	if len(mons) < c.spec.Mon.Count {
+	if len(mons)-externalArbiters < c.spec.Mon.Count {
 		logger.Debug("new cluster or mon failover in progress, not checking for extra mon deployments")
 		return ""
 	}
@@ -1111,6 +1145,9 @@ func (c *Cluster) waitForMonsToJoin(mons []*monConfig, requireAllInQuorum bool) 
 
 	starting := []string{}
 	for _, m := range mons {
+		if m.ExternalArbiter {
+			continue
+		}
 		starting = append(starting, m.DaemonName)
 	}
 

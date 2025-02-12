@@ -1,0 +1,400 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: emon4
+  namespace: rook-ceph
+spec:
+  clusterIP: 10.104.90.169
+  internalTrafficPolicy: Cluster
+  ipFamilies:
+  - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+  - name: tcp-msgr1
+    port: 6789
+    protocol: TCP
+    targetPort: 6789
+  - name: tcp-msgr2
+    port: 3300
+    protocol: TCP
+    targetPort: 3300
+  selector:
+    app: emon4
+  sessionAffinity: None
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: emon4
+  name: emon4-pod
+  namespace: rook-ceph
+spec:
+  containers:
+  - args:
+    - --fsid=505d30c6-a2ab-4bab-a52a-22140fe17e88
+    - --keyring=/etc/ceph/keyring-store/keyring
+    - --default-log-to-stderr=true
+    - --default-err-to-stderr=true
+    - --default-mon-cluster-log-to-stderr=true
+    - '--default-log-stderr-prefix=debug '
+    - --default-log-to-file=false
+    - --default-mon-cluster-log-to-file=false
+    # - --mon-host=$(ROOK_CEPH_MON_HOST)
+    - --mon-initial-members=$(ROOK_CEPH_MON_INITIAL_MEMBERS)
+    - --id=emon4
+    - --setuser=ceph
+    - --setgroup=ceph
+    - --foreground
+    - --public-addr=10.104.90.169
+    - --setuser-match-path=/var/lib/ceph/mon/ceph-emon4/store.db
+    - --public-bind-addr=$(ROOK_POD_IP)
+    - --debug-mon=20
+    command:
+    - ceph-mon
+    env:
+    - name: CONTAINER_IMAGE
+      value: quay.io/ceph/ceph:v19
+    - name: POD_NAME
+      valueFrom:
+        fieldRef:
+          apiVersion: v1
+          fieldPath: metadata.name
+    - name: POD_NAMESPACE
+      valueFrom:
+        fieldRef:
+          apiVersion: v1
+          fieldPath: metadata.namespace
+    - name: NODE_NAME
+      valueFrom:
+        fieldRef:
+          apiVersion: v1
+          fieldPath: spec.nodeName
+    - name: POD_MEMORY_LIMIT
+      valueFrom:
+        resourceFieldRef:
+          divisor: "0"
+          resource: limits.memory
+    - name: POD_MEMORY_REQUEST
+      valueFrom:
+        resourceFieldRef:
+          divisor: "0"
+          resource: requests.memory
+    - name: POD_CPU_LIMIT
+      valueFrom:
+        resourceFieldRef:
+          divisor: "1"
+          resource: limits.cpu
+    - name: POD_CPU_REQUEST
+      valueFrom:
+        resourceFieldRef:
+          divisor: "0"
+          resource: requests.cpu
+    - name: CEPH_USE_RANDOM_NONCE
+      value: "true"
+    - name: ROOK_CEPH_MON_HOST
+      valueFrom:
+        secretKeyRef:
+          key: mon_host
+          name: rook-ceph-config
+    - name: ROOK_CEPH_MON_INITIAL_MEMBERS
+      valueFrom:
+        secretKeyRef:
+          key: mon_initial_members
+          name: rook-ceph-config
+    - name: ROOK_POD_IP
+      valueFrom:
+        fieldRef:
+          apiVersion: v1
+          fieldPath: status.podIP
+    image: quay.io/ceph/ceph:v19
+    imagePullPolicy: IfNotPresent
+    livenessProbe:
+      exec:
+        command:
+        - env
+        - -i
+        - sh
+        - -c
+        - "\noutp=\"$(ceph --admin-daemon /run/ceph/ceph-mon.emon4.asok mon_status 2>&1)\"\nrc=$?\nif
+          [ $rc -ne 0 ]; then\n\techo \"ceph daemon health check failed with the following
+          output:\"\n\techo \"$outp\" | sed -e 's/^/> /g'\n\texit $rc\nfi\n"
+      failureThreshold: 3
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      successThreshold: 1
+      timeoutSeconds: 5
+    name: mon
+    ports:
+    - containerPort: 3300
+      name: tcp-msgr2
+      protocol: TCP
+    - containerPort: 6789
+      name: tcp-msgr1
+      protocol: TCP
+    resources: {}
+    securityContext:
+      capabilities:
+        drop:
+        - NET_RAW
+      privileged: false
+    startupProbe:
+      exec:
+        command:
+        - env
+        - -i
+        - sh
+        - -c
+        - "\noutp=\"$(ceph --admin-daemon /run/ceph/ceph-mon.emon4.asok mon_status 2>&1)\"\nrc=$?\nif
+          [ $rc -ne 0 ]; then\n\techo \"ceph daemon health check failed with the following
+          output:\"\n\techo \"$outp\" | sed -e 's/^/> /g'\n\texit $rc\nfi\n"
+      failureThreshold: 6
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      successThreshold: 1
+      timeoutSeconds: 5
+    terminationMessagePath: /dev/termination-log
+    terminationMessagePolicy: File
+    volumeMounts:
+    - mountPath: /etc/ceph
+      name: rook-config-override
+      readOnly: true
+    - mountPath: /run/ceph
+      name: ceph-daemons-sock-dir
+    - mountPath: /etc/ceph/keyring-store/
+      name: rook-ceph-mons-keyring
+      readOnly: true
+    - mountPath: /var/log/ceph
+      name: rook-ceph-log
+    - mountPath: /var/lib/ceph/crash
+      name: rook-ceph-crash
+    - mountPath: /var/lib/ceph/mon/ceph-emon4
+      name: ceph-daemon-data
+    - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+      name: kube-api-access-wjpzz
+      readOnly: true
+    workingDir: /var/log/ceph
+  dnsPolicy: ClusterFirst
+  enableServiceLinks: true
+  initContainers:
+  - args:
+    - --verbose
+    - --recursive
+    - ceph:ceph
+    - /var/log/ceph
+    - /var/lib/ceph/crash
+    - /run/ceph
+    - /var/lib/ceph/mon/ceph-emon4
+    command:
+    - chown
+    image: quay.io/ceph/ceph:v19
+    imagePullPolicy: IfNotPresent
+    name: chown-container-data-dir
+    resources: {}
+    securityContext:
+      capabilities:
+        drop:
+        - NET_RAW
+      privileged: false
+    terminationMessagePath: /dev/termination-log
+    terminationMessagePolicy: File
+    volumeMounts:
+    - mountPath: /etc/ceph
+      name: rook-config-override
+      readOnly: true
+    - mountPath: /run/ceph
+      name: ceph-daemons-sock-dir
+    - mountPath: /etc/ceph/keyring-store/
+      name: rook-ceph-mons-keyring
+      readOnly: true
+    - mountPath: /var/log/ceph
+      name: rook-ceph-log
+    - mountPath: /var/lib/ceph/crash
+      name: rook-ceph-crash
+    - mountPath: /var/lib/ceph/mon/ceph-emon4
+      name: ceph-daemon-data
+    - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+      name: kube-api-access-wjpzz
+      readOnly: true
+  - args:
+    - --fsid=505d30c6-a2ab-4bab-a52a-22140fe17e88
+    - --keyring=/etc/ceph/keyring-store/keyring
+    - --default-log-to-stderr=true
+    - --default-err-to-stderr=true
+    - --default-mon-cluster-log-to-stderr=true
+    - '--default-log-stderr-prefix=debug '
+    - --default-log-to-file=false
+    - --default-mon-cluster-log-to-file=false
+    # - --mon-host=$(ROOK_CEPH_MON_HOST)
+    # - --mon-initial-members=$(ROOK_CEPH_MON_INITIAL_MEMBERS)
+    - --id=emon4
+    - --monmap=/tmp/monmap/monmap
+    - --setuser=ceph
+    - --setgroup=ceph
+    # - --public-addr=10.104.90.169
+    - --mkfs
+    command:
+    - ceph-mon
+    env:
+    - name: CONTAINER_IMAGE
+      value: quay.io/ceph/ceph:v19
+    - name: POD_NAME
+      valueFrom:
+        fieldRef:
+          apiVersion: v1
+          fieldPath: metadata.name
+    - name: POD_NAMESPACE
+      valueFrom:
+        fieldRef:
+          apiVersion: v1
+          fieldPath: metadata.namespace
+    - name: NODE_NAME
+      valueFrom:
+        fieldRef:
+          apiVersion: v1
+          fieldPath: spec.nodeName
+    - name: POD_MEMORY_LIMIT
+      valueFrom:
+        resourceFieldRef:
+          divisor: "0"
+          resource: limits.memory
+    - name: POD_MEMORY_REQUEST
+      valueFrom:
+        resourceFieldRef:
+          divisor: "0"
+          resource: requests.memory
+    - name: POD_CPU_LIMIT
+      valueFrom:
+        resourceFieldRef:
+          divisor: "1"
+          resource: limits.cpu
+    - name: POD_CPU_REQUEST
+      valueFrom:
+        resourceFieldRef:
+          divisor: "0"
+          resource: requests.cpu
+    - name: CEPH_USE_RANDOM_NONCE
+      value: "true"
+    - name: ROOK_CEPH_MON_HOST
+      valueFrom:
+        secretKeyRef:
+          key: mon_host
+          name: rook-ceph-config
+    - name: ROOK_CEPH_MON_INITIAL_MEMBERS
+      valueFrom:
+        secretKeyRef:
+          key: mon_initial_members
+          name: rook-ceph-config
+    image: quay.io/ceph/ceph:v19
+    imagePullPolicy: IfNotPresent
+    name: init-mon-fs
+    resources: {}
+    securityContext:
+      capabilities:
+        drop:
+        - NET_RAW
+      privileged: false
+    terminationMessagePath: /dev/termination-log
+    terminationMessagePolicy: File
+    volumeMounts:
+    - mountPath: /tmp/monmap
+      name: monmap
+      readOnly: true
+    - mountPath: /etc/ceph
+      name: rook-config-override
+      readOnly: true
+    - mountPath: /run/ceph
+      name: ceph-daemons-sock-dir
+    - mountPath: /etc/ceph/keyring-store/
+      name: rook-ceph-mons-keyring
+      readOnly: true
+    - mountPath: /var/log/ceph
+      name: rook-ceph-log
+    - mountPath: /var/lib/ceph/crash
+      name: rook-ceph-crash
+    - mountPath: /var/lib/ceph/mon/ceph-emon4
+      name: ceph-daemon-data
+    - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+      name: kube-api-access-wjpzz
+      readOnly: true
+  nodeName: lima-rook
+  nodeSelector:
+    kubernetes.io/hostname: lima-rook
+  preemptionPolicy: PreemptLowerPriority
+  priority: 2000001000
+  priorityClassName: system-node-critical
+  restartPolicy: Always
+  schedulerName: default-scheduler
+  securityContext: {}
+  serviceAccount: rook-ceph-default
+  serviceAccountName: rook-ceph-default
+  terminationGracePeriodSeconds: 30
+  tolerations:
+  - effect: NoExecute
+    key: node.kubernetes.io/not-ready
+    operator: Exists
+    tolerationSeconds: 300
+  - effect: NoExecute
+    key: node.kubernetes.io/unreachable
+    operator: Exists
+    tolerationSeconds: 300
+  volumes:
+  - name: monmap
+    projected:
+      defaultMode: 420
+      sources:
+      - configMap:
+          items:
+          - key: monmap
+            mode: 292
+            path: monmap
+          name: monmap
+  - name: rook-config-override
+    projected:
+      defaultMode: 420
+      sources:
+      - configMap:
+          items:
+          - key: config
+            mode: 292
+            path: ceph.conf
+          name: rook-config-override
+  - name: rook-ceph-mons-keyring
+    secret:
+      defaultMode: 420
+      secretName: rook-ceph-mons-keyring
+  - hostPath:
+      path: /var/lib/rook/exporter
+      type: DirectoryOrCreate
+    name: ceph-daemons-sock-dir
+  - hostPath:
+      path: /var/lib/rook/rook-ceph/log
+      type: ""
+    name: rook-ceph-log
+  - hostPath:
+      path: /var/lib/rook/rook-ceph/crash
+      type: ""
+    name: rook-ceph-crash
+  - hostPath:
+      path: /var/lib/rook/mon-emon4/data
+      type: ""
+    name: ceph-daemon-data
+  - name: kube-api-access-wjpzz
+    projected:
+      defaultMode: 420
+      sources:
+      - serviceAccountToken:
+          expirationSeconds: 3607
+          path: token
+      - configMap:
+          items:
+          - key: ca.crt
+            path: ca.crt
+          name: kube-root-ca.crt
+      - downwardAPI:
+          items:
+          - fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+            path: namespace

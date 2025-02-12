@@ -23,6 +23,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -151,6 +152,11 @@ func CreateOrLoadClusterInfo(clusterdContext *clusterd.Context, context context.
 	clusterInfo.Monitors, maxMonID, monMapping, err = loadMonConfig(clusterdContext.Clientset, namespace)
 	if err != nil {
 		return nil, maxMonID, monMapping, errors.Wrap(err, "failed to get mon config")
+	}
+	for monID := range clusterInfo.Monitors {
+		if slices.Contains(cephClusterSpec.Mon.ExternalMonIDs, monID) {
+			clusterInfo.Monitors[monID].ExternalArbiter = true
+		}
 	}
 
 	// update clusterInfo with cephCLusterSpec Network info
