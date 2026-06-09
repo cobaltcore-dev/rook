@@ -159,12 +159,6 @@ func (r *ReconcileClusterDisruption) reconcile(request reconcile.Request) (recon
 		return reconcile.Result{}, nil
 	}
 
-	// get a list of all the failure domains, failure domains with failed OSDs and failure domains with drained nodes
-	allFailureDomains, nodeDrainFailureDomains, osdDownFailureDomains, downOSDs, err := r.getOSDFailureDomains(clusterInfo, request, poolFailureDomain)
-	if err != nil {
-		return reconcile.Result{}, err
-	}
-
 	// get the map that stores currently draining failure domain
 	pdbStateMap, err := r.initializePDBState(request)
 	if err != nil {
@@ -172,6 +166,60 @@ func (r *ReconcileClusterDisruption) reconcile(request reconcile.Request) (recon
 	}
 
 	pgHealthyRegex := cephCluster.Spec.DisruptionManagement.PGHealthyRegex
+
+	// Idle fast path: if no OSD is down and no drain bookkeeping exists, the PDB layout is the
+	// same on either path (just the default PDB), so apply it without any Ceph reads. This keeps
+	// the common steady state -- and every reconcile on a cluster that never classifies its pools
+	// -- off the CRUSH/PG queries, and stops a transient Ceph read failure from blocking PDB
+	// management for an otherwise-healthy cluster.
+	osdDown, err := r.anyOSDDown(request)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if !osdDown && !hasActiveDrainState(pdbStateMap) {
+		return r.reconcileIdleOSDPDBs(request)
+	}
+
+	// Determine device-class isolation from the live CRUSH map, not from CR specs: a pool whose
+	// CRUSH rule spans device classes (including pools with no CR, like the CephNFS .nfs pool)
+	// means a class drain can endanger data on another class's OSDs, so the operator must use the
+	// global, class-agnostic fallback. Resolving this from CRUSH also makes the isolation decision
+	// and the per-class PG cleanliness check share one source of truth.
+	classPoolMap, err := cephClient.GetDeviceClassPools(r.context.ClusterdContext, clusterInfo)
+	if err != nil {
+		return cephNotReadyResult(request, err)
+	}
+	classIsolated := !classPoolMap.HasSpanningPool && len(classPoolMap.Pools) > 0
+
+	// Use the device-class-aware path only when every pool isolates a device class and no legacy
+	// (pre-upgrade) global drain is in progress. A non-empty legacy drainingFailureDomain key means
+	// a drain started under the old code; finish it on the class-agnostic path, after which
+	// subsequent drains use the class-aware path. See "Mid-drain upgrade" in the design.
+	if classIsolated && pdbStateMap.Data[drainingFailureDomainKey] == "" {
+		classFailureDomain := map[string]string{}
+		for class, fdTypes := range classPoolMap.FailureDomains {
+			classFailureDomain[class] = minimumFailureDomainFromTypes(fdTypes)
+		}
+		classStates, err := r.getOSDFailureDomainsByClass(clusterInfo, request, classFailureDomain)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+		return r.reconcilePDBsForOSDsByClass(clusterInfo, request, pdbStateMap, classStates, classPoolMap.Pools, pgHealthyRegex)
+	}
+
+	// Fallback (class-agnostic) path. If isolation was lost while a per-class drain was active
+	// (for example an unclassified pool was added), remove any class-scoped PDBs and per-class
+	// ConfigMap keys first so they cannot coexist with the fallback PDBs and double-match a pod.
+	if err := r.cleanupDeviceClassArtifacts(request.Namespace, pdbStateMap); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	// get a list of all the failure domains, failure domains with failed OSDs and failure domains with drained nodes
+	allFailureDomains, nodeDrainFailureDomains, osdDownFailureDomains, downOSDs, err := r.getOSDFailureDomains(clusterInfo, request, poolFailureDomain)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
 	return r.reconcilePDBsForOSDs(clusterInfo, request, pdbStateMap, poolFailureDomain, allFailureDomains, osdDownFailureDomains, nodeDrainFailureDomains, downOSDs, pgHealthyRegex)
 }
 

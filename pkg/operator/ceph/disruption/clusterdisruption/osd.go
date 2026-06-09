@@ -46,7 +46,11 @@ const (
 	// osdPDBAppName is that app label value for pdbs targeting osds
 	osdPDBAppName = "rook-ceph-osd"
 	// osdPDBOsdIdLabel is the label on osd pods for pdbs targeting specific osd ids
-	osdPDBOsdIdLabel                 = "osd"
+	osdPDBOsdIdLabel = "osd"
+	// osdDeviceClassLabel is the label on osd pods carrying the Ceph device class,
+	// set from osd.DeviceClass (see pkg/operator/ceph/cluster/osd/labels.go). The
+	// device-class-aware PDB selectors match against it.
+	osdDeviceClassLabel              = "device-class"
 	drainingFailureDomainKey         = "draining-failure-domain"
 	drainingFailureDomainDurationKey = "draining-failure-domain-duration"
 	setNoOut                         = "set-no-out"
@@ -73,7 +77,11 @@ func (r *ReconcileClusterDisruption) deletePDB(pdb client.Object) error {
 
 // createDefaultPDBforOSD creates a single PDB for all OSDs with maxUnavailable=1
 // This allows all OSDs in a single failure domain to go down.
-func (r *ReconcileClusterDisruption) createDefaultPDBforOSD(namespace string, excludeOSDs []int) error {
+//
+// notInClasses, when non-empty, adds a `device-class NotIn` clause so OSDs of currently
+// draining device classes are excluded from the default PDB and protected instead by the
+// per-class blocking PDBs. It is empty on the fallback (class-agnostic) path.
+func (r *ReconcileClusterDisruption) createDefaultPDBforOSD(namespace string, excludeOSDs []int, notInClasses []string) error {
 	cephCluster, ok := r.clusterMap.GetCluster(namespace)
 	if !ok {
 		return errors.Errorf("failed to find the namespace %q in the clustermap", namespace)
@@ -101,6 +109,14 @@ func (r *ReconcileClusterDisruption) createDefaultPDBforOSD(namespace string, ex
 			Key:      osdPDBOsdIdLabel,
 			Operator: metav1.LabelSelectorOpNotIn,
 			Values:   excludeOSDsValues,
+		})
+	}
+	if len(notInClasses) > 0 {
+		matchExpressions = append(matchExpressions, metav1.LabelSelectorRequirement{
+			// exclude OSDs of device classes that are currently draining
+			Key:      osdDeviceClassLabel,
+			Operator: metav1.LabelSelectorOpNotIn,
+			Values:   notInClasses,
 		})
 	}
 
@@ -369,7 +385,7 @@ func (r *ReconcileClusterDisruption) handleActiveDrains(allFailureDomains []stri
 }
 
 func (r *ReconcileClusterDisruption) handleInactiveDrains(allFailureDomains []string, failureDomainType, namespace string, excludeOSDs []int) error {
-	err := r.createDefaultPDBforOSD(namespace, excludeOSDs)
+	err := r.createDefaultPDBforOSD(namespace, excludeOSDs, nil)
 	if err != nil {
 		return errors.Wrap(err, "failed to create default pdb")
 	}

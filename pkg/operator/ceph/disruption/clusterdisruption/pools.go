@@ -76,7 +76,18 @@ func (r *ReconcileClusterDisruption) processPools(request reconcile.Request) (*c
 }
 
 func getMinimumFailureDomain(poolList []cephv1.PoolSpec) string {
-	if len(poolList) == 0 {
+	fdTypes := make([]string, len(poolList))
+	for i, pool := range poolList {
+		fdTypes[i] = pool.FailureDomain
+	}
+	return minimumFailureDomainFromTypes(fdTypes)
+}
+
+// minimumFailureDomainFromTypes returns the lowest CRUSH failure-domain level among the given
+// failure-domain types, mirroring the rule that the PDB failure domain is the lowest one any
+// pool enforces. It returns the default failure domain when none match a known CRUSH level.
+func minimumFailureDomainFromTypes(fdTypes []string) string {
+	if len(fdTypes) == 0 {
 		return cephv1.DefaultFailureDomain
 	}
 
@@ -84,13 +95,13 @@ func getMinimumFailureDomain(poolList []cephv1.PoolSpec) string {
 	minfailureDomainIndex := len(topology.CRUSHMapLevelsOrdered) - 1
 	matched := false
 
-	for _, pool := range poolList {
+	for _, fdType := range fdTypes {
 		for index, failureDomain := range topology.CRUSHMapLevelsOrdered {
 			if index == minfailureDomainIndex {
 				// index is higher-than/equal-to the min
 				break
 			}
-			if pool.FailureDomain == failureDomain {
+			if fdType == failureDomain {
 				// new min found
 				matched = true
 				minfailureDomainIndex = index
