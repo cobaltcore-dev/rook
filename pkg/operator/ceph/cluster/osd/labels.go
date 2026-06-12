@@ -36,6 +36,8 @@ const (
 	OSDOverPVCLabelKey = "ceph.rook.io/pvc"
 	// TopologyLocationLabel is the crush location label added to OSD deployments
 	TopologyLocationLabel = "topology-location-%s"
+	// DeviceClassLabelKey is the label on OSD pods holding the OSD's device class
+	DeviceClassLabelKey = deviceClass
 	// CephImageLabelKey is the ceph image version label added to PVC
 	CephImageLabelKey = "ceph.rook.io/cephImageAtCreation"
 	// RookImageLabelKey is the rook image version label added to PVC

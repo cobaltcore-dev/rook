@@ -19,6 +19,7 @@ package clusterdisruption
 import (
 	ctx "context"
 	"reflect"
+	"strings"
 
 	"github.com/rook/rook/pkg/operator/ceph/disruption/controllerconfig"
 
@@ -69,8 +70,11 @@ func pdbPredicate[T *policyv1.PodDisruptionBudget]() predicate.TypedFuncs[T] {
 		UpdateFunc: func(e event.TypedUpdateEvent[T]) bool {
 			pdb := (*policyv1.PodDisruptionBudget)(e.ObjectNew)
 
-			// reconcile for the main PDB update event when first OSD goes down, that is, when `DisruptionsAllowed` gets updated to 0.
-			return pdb.Name == osdPDBAppName && pdb.Spec.MaxUnavailable.IntVal == 1 && pdb.Status.DisruptionsAllowed == 0
+			// Reconcile when the first OSD of a group goes down. ExpectedPods>0 excludes a
+			// default PDB that selects no OSDs: it also reports DisruptionsAllowed=0, but
+			// that is not a drain.
+			isOSDDefaultPDB := pdb.Name == osdPDBAppName || strings.HasPrefix(pdb.Name, osdPDBAppName+"-")
+			return isOSDDefaultPDB && pdb.Spec.MaxUnavailable.IntVal == 1 && pdb.Status.DisruptionsAllowed == 0 && pdb.Status.ExpectedPods > 0
 		},
 		DeleteFunc: func(e event.TypedDeleteEvent[T]) bool {
 			// Do not reconcile when PDB is deleted
