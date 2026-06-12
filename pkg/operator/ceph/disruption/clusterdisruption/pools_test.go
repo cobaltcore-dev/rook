@@ -21,31 +21,21 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 )
 
-func TestGetMinimumFailureDomain(t *testing.T) {
-	poolList := []cephv1.PoolSpec{
-		{FailureDomain: "region"},
-		{FailureDomain: "zone"},
-	}
+func TestGlobalFailureDomain(t *testing.T) {
+	// the finest (lowest in the CRUSH hierarchy) of the in-use pools' failure domains
+	layout := &cephclient.DeviceClassPDBLayout{FailureDomainTypes: []string{"region", "zone"}}
+	assert.Equal(t, "zone", globalFailureDomain(layout))
 
-	assert.Equal(t, "zone", getMinimumFailureDomain(poolList))
+	layout = &cephclient.DeviceClassPDBLayout{FailureDomainTypes: []string{"region", "zone", "host"}}
+	assert.Equal(t, "host", globalFailureDomain(layout))
 
-	poolList = []cephv1.PoolSpec{
-		{FailureDomain: "region"},
-		{FailureDomain: "zone"},
-		{FailureDomain: "host"},
-	}
+	// unknown levels and an empty list fall back to the default failure domain
+	layout = &cephclient.DeviceClassPDBLayout{FailureDomainTypes: []string{"aaa", "bbb", "ccc"}}
+	assert.Equal(t, "host", globalFailureDomain(layout))
 
-	assert.Equal(t, "host", getMinimumFailureDomain(poolList))
-
-	// test default
-	poolList = []cephv1.PoolSpec{
-		{FailureDomain: "aaa"},
-		{FailureDomain: "bbb"},
-		{FailureDomain: "ccc"},
-	}
-
-	assert.Equal(t, "host", getMinimumFailureDomain(poolList))
+	layout = &cephclient.DeviceClassPDBLayout{}
+	assert.Equal(t, "host", globalFailureDomain(layout))
 }

@@ -115,6 +115,15 @@ func getFakeClusterInfo() *client.ClusterInfo {
 	return sharedClusterMap.GetClusterInfo(namespace)
 }
 
+// enumerateGlobalGroup runs populateOSDFailureDomains for a single cluster-wide group
+// and returns its state as the baseline tuple, so the baseline enumeration tests can
+// assert on the group-parameterized implementation unchanged.
+func enumerateGlobalGroup(r *ReconcileClusterDisruption, clusterInfo *client.ClusterInfo, request reconcile.Request, failureDomainType string) ([]string, []string, []string, []int, error) {
+	g := &pdbGroup{failureDomainType: failureDomainType}
+	err := r.populateOSDFailureDomains(clusterInfo, request, []*pdbGroup{g})
+	return g.state.allFailureDomains, g.state.nodeDrainFailureDomains, g.state.osdDownFailureDomains, g.state.downOSDs, err
+}
+
 func TestGetOSDFailureDomains(t *testing.T) {
 	testcases := []struct {
 		name                           string
@@ -239,7 +248,7 @@ func TestGetOSDFailureDomains(t *testing.T) {
 			clusterInfo.Context = context.TODO()
 			r.context = &controllerconfig.Context{ClusterdContext: &clusterd.Context{Executor: executor}}
 			request := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace}}
-			allfailureDomains, nodeDrainFailureDomains, osdDownFailureDomains, downOSDs, err := r.getOSDFailureDomains(clusterInfo, request, "zone")
+			allfailureDomains, nodeDrainFailureDomains, osdDownFailureDomains, downOSDs, err := enumerateGlobalGroup(r, clusterInfo, request, "zone")
 			assert.NoError(t, err)
 			assert.Equal(t, tc.expectedAllFailureDomains, allfailureDomains)
 			assert.Equal(t, tc.expectedDrainingFailureDomains, nodeDrainFailureDomains)
@@ -249,54 +258,35 @@ func TestGetOSDFailureDomains(t *testing.T) {
 	}
 }
 
-func TestGetOSDFailureDomainsError(t *testing.T) {
-	testcases := []struct {
-		name                           string
-		osds                           []appsv1.Deployment
-		expectedAllFailureDomains      []string
-		expectedDrainingFailureDomains []string
-		expectedOsdDownFailureDomains  []string
-		expectedDownOSDs               []int
-	}{
-		{
-			name: "case 1: one or more OSD deployment is missing crush location label",
-			osds: []appsv1.Deployment{
-				fakeOSDDeployment(1, 1), fakeOSDDeployment(2, 1),
-				fakeOSDDeployment(3, 1),
-			},
-			expectedAllFailureDomains:      nil,
-			expectedDrainingFailureDomains: nil,
-			expectedOsdDownFailureDomains:  nil,
-			expectedDownOSDs:               nil,
-		},
+func TestGetOSDFailureDomainsDegradesOnMissingLabel(t *testing.T) {
+	// An OSD deployment missing the group's failure-domain label must degrade the
+	// group (default-only), not abort the whole reconcile.
+	osds := []appsv1.Deployment{
+		fakeOSDDeployment(1, 1), fakeOSDDeployment(2, 1), fakeOSDDeployment(3, 1),
 	}
+	executor := &exectest.MockExecutor{}
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
+		logger.Infof("Command: %s %v", command, args)
+		if args[0] == "osd" && args[1] == "metadata" {
+			return `[{"id": 1, "hostname": "node-1"}, {"id": 2, "hostname": "node-2"}, {"id": 3, "hostname": "node-3"}]`, nil
+		}
+		return "", errors.Errorf("unexpected ceph command '%v'", args)
+	}
+	osd := osds[0].DeepCopy()
+	osd.Labels["topology-location-zone"] = ""
+	r := getFakeReconciler(t, cephCluster, &corev1.ConfigMap{},
+		osds[1].DeepCopy(), osds[2].DeepCopy(), osd)
+	r.context = &controllerconfig.Context{ClusterdContext: &clusterd.Context{Executor: executor}}
+	clusterInfo := getFakeClusterInfo()
+	clusterInfo.Context = context.TODO()
+	request := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace}}
 
-	for _, tc := range testcases {
-		t.Run(tc.name, func(t *testing.T) {
-			executor := &exectest.MockExecutor{}
-			executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
-				logger.Infof("Command: %s %v", command, args)
-				if args[0] == "osd" && args[1] == "metadata" {
-					return `[{"id": 1, "hostname": "node-1"}, {"id": 2, "hostname": "node-2"}, {"id": 3, "hostname": "node-3"}]`, nil
-				}
-				return "", errors.Errorf("unexpected ceph command '%v'", args)
-			}
-			osd := tc.osds[0].DeepCopy()
-			osd.Labels["topology-location-zone"] = ""
-			r := getFakeReconciler(t, cephCluster, &corev1.ConfigMap{},
-				tc.osds[1].DeepCopy(), tc.osds[2].DeepCopy(), osd)
-			r.context = &controllerconfig.Context{ClusterdContext: &clusterd.Context{Executor: executor}}
-			clusterInfo := getFakeClusterInfo()
-			clusterInfo.Context = context.TODO()
-			request := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace}}
-			allfailureDomains, nodeDrainFailureDomains, osdDownFailureDomains, downOSDs, err := r.getOSDFailureDomains(clusterInfo, request, "zone")
-			assert.Error(t, err)
-			assert.Equal(t, tc.expectedAllFailureDomains, allfailureDomains)
-			assert.Equal(t, tc.expectedDrainingFailureDomains, nodeDrainFailureDomains)
-			assert.Equal(t, tc.expectedOsdDownFailureDomains, osdDownFailureDomains)
-			assert.Equal(t, tc.expectedDownOSDs, downOSDs)
-		})
-	}
+	g := &pdbGroup{failureDomainType: "zone"}
+	err := r.populateOSDFailureDomains(clusterInfo, request, []*pdbGroup{g})
+	assert.NoError(t, err)
+	assert.True(t, g.degraded)
+	assert.Empty(t, g.state.allFailureDomains)
+	assert.Empty(t, g.state.downOSDs)
 }
 
 func TestReconcilePDBForOSD(t *testing.T) {
@@ -427,7 +417,15 @@ func TestReconcilePDBForOSD(t *testing.T) {
 			test.SetFakeKubernetesVersion(clientset, "v1.21.0")
 			r.context = &controllerconfig.Context{ClusterdContext: &clusterd.Context{Executor: executor, Clientset: clientset}}
 
-			_, err := r.reconcilePDBsForOSDs(clusterInfo, request, tc.configMap, "zone", tc.allFailureDomains, tc.osdDownFailureDomains, tc.activeNodeDrains, tc.downOSDs, tc.pgHealthyRegex)
+			// single global group reproduces the baseline fallback behavior
+			g := newPDBGroup("", "zone", nil)
+			g.state = groupDrainState{
+				allFailureDomains:       tc.allFailureDomains,
+				osdDownFailureDomains:   tc.osdDownFailureDomains,
+				nodeDrainFailureDomains: tc.activeNodeDrains,
+				downOSDs:                tc.downOSDs,
+			}
+			_, err := r.reconcilePDBsForOSDs(clusterInfo, request, tc.configMap, []*pdbGroup{g}, tc.pgHealthyRegex)
 			assert.NoError(t, err)
 
 			// assert that pdb for osd are created correctly
@@ -487,6 +485,50 @@ func TestReconcilePDBForOSD(t *testing.T) {
 			assert.Equal(t, tc.expectedSetNoOutValue, existingConfigMaps.Items[0].Data[setNoOut])
 		})
 	}
+}
+
+func TestInitializePDBStateNilData(t *testing.T) {
+	// A ConfigMap whose drain-state keys were all deleted is stored with no data
+	// field and reloads with a nil Data map. initializePDBState must return a
+	// writable (non-nil) map so the subsequent setPDBConfig writes do not panic.
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: pdbStateMapName, Namespace: namespace},
+		// Data intentionally nil, as reloaded from the apiserver after all keys were deleted
+	}
+	r := getFakeReconciler(t, cephCluster, cm)
+	r.context = &controllerconfig.Context{OpManagerContext: context.TODO()}
+	request := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace}}
+
+	pdbStateMap, err := r.initializePDBState(request)
+	assert.NoError(t, err)
+	assert.NotNil(t, pdbStateMap.Data)
+	// writing drain state must not panic on the returned map
+	setPDBConfig(pdbStateMap, globalDrainKeys, []string{"zone-1"}, nil)
+	assert.Equal(t, "zone-1", pdbStateMap.Data[drainingFailureDomainKey])
+}
+
+func TestRequeuePDBController(t *testing.T) {
+	r := &ReconcileClusterDisruption{}
+
+	// idle: no drain, no down OSD -> success, no requeue
+	idle := &pdbGroup{}
+	assert.Zero(t, r.requeuePDBController(&corev1.ConfigMap{Data: map[string]string{}}, []*pdbGroup{idle}).RequeueAfter)
+
+	// down OSD but not draining (e.g. down+clean, excluded) -> requeue so the
+	// exclusion is removed when the OSD recovers (no deployment watch event fires)
+	down := &pdbGroup{state: groupDrainState{downOSDs: []int{3}}}
+	assert.NotZero(t, r.requeuePDBController(&corev1.ConfigMap{Data: map[string]string{}}, []*pdbGroup{down}).RequeueAfter)
+
+	// actively draining -> requeue
+	draining := &pdbGroup{}
+	cm := &corev1.ConfigMap{Data: map[string]string{drainingFailureDomainKey: "zone-1"}}
+	assert.NotZero(t, r.requeuePDBController(cm, []*pdbGroup{draining}).RequeueAfter)
+
+	// one class draining requeues even if another class is idle
+	idleClass := &pdbGroup{deviceClass: "ssd"}
+	drainingClass := &pdbGroup{deviceClass: "hdd"}
+	cm2 := &corev1.ConfigMap{Data: map[string]string{dcDrainingKey("hdd"): "node-1"}}
+	assert.NotZero(t, r.requeuePDBController(cm2, []*pdbGroup{idleClass, drainingClass}).RequeueAfter)
 }
 
 func TestHasNodeDrained(t *testing.T) {
@@ -575,7 +617,7 @@ func TestSetPDBConfig(t *testing.T) {
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
-			setPDBConfig(tc.pdbConfig, tc.osdDownFailureDomains, tc.drainingFailureDomains)
+			setPDBConfig(tc.pdbConfig, globalDrainKeys, tc.osdDownFailureDomains, tc.drainingFailureDomains)
 			assert.Equal(t, tc.expectedFailureDomainKeyValue, tc.pdbConfig.Data[drainingFailureDomainKey])
 			assert.Equal(t, tc.expecteNoOutSetting, tc.pdbConfig.Data[setNoOut])
 		})

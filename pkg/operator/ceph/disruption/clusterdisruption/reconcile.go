@@ -136,43 +136,48 @@ func (r *ReconcileClusterDisruption) reconcile(request reconcile.Request) (recon
 		logger.Debugf("Using default maintenance timeout: %v", r.maintenanceTimeout)
 	}
 
-	//  reconcile the pools and get the failure domain
-	cephObjectStoreList, cephFilesystemList, poolFailureDomain, poolCount, err := r.processPools(request)
+	// reconcile the RGW and MDS PDBs; each lists its own CRs and reports whether any exist
+	objectStorePoolsExist, err := r.reconcileCephObjectStore(request)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	filesystemPoolsExist, err := r.reconcileCephFilesystem(request)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	blockPoolsExist, err := r.cephBlockPoolsExist(request)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
 
-	// reconcile the pdbs for objectstores
-	err = r.reconcileCephObjectStore(cephObjectStoreList)
-	if err != nil {
-		return reconcile.Result{}, err
-	}
-
-	// reconcile the pdbs for filesystems
-	err = r.reconcileCephFilesystem(cephFilesystemList)
-	if err != nil {
-		return reconcile.Result{}, err
-	}
-
-	// no pools, no need to reconcile OSD PDB
-	if poolCount < 1 {
+	// No pool-bearing CRs, no need to reconcile OSD PDBs. NOTE (pre-existing gap): this
+	// sees only pool CRs, so a cluster whose pools were all created directly via the
+	// toolbox (no CR) gets no OSD PDB protection. Closing it means deriving pool existence
+	// from the CRUSH/pool-list read instead; out of scope here.
+	if !objectStorePoolsExist && !filesystemPoolsExist && !blockPoolsExist {
 		return reconcile.Result{}, nil
 	}
 
-	// get a list of all the failure domains, failure domains with failed OSDs and failure domains with drained nodes
-	allFailureDomains, nodeDrainFailureDomains, osdDownFailureDomains, downOSDs, err := r.getOSDFailureDomains(clusterInfo, request, poolFailureDomain)
+	pgHealthyRegex := cephCluster.Spec.DisruptionManagement.PGHealthyRegex
+
+	// Build the OSD PDB groups from the live CRUSH map, each with its failure-domain state
+	// (one group per device class when the cluster qualifies, else a single cluster-wide group).
+	groups, err := r.buildOSDPDBGroups(clusterInfo, request)
 	if err != nil {
-		return reconcile.Result{}, err
+		// Any read here is a transient "ceph not ready" condition. Requeue and leave the
+		// existing PDBs and drain state untouched; proceeding with a different group set
+		// mid-reconcile would churn an in-flight drain's state.
+		logger.Debugf("failed to build OSD PDB groups, requeuing: %v", err)
+		return opcontroller.WaitForRequeueIfCephClusterNotReady, nil
 	}
 
-	// get the map that stores currently draining failure domain
+	// initialize the map that tracks each group's draining failure domain
 	pdbStateMap, err := r.initializePDBState(request)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
 
-	pgHealthyRegex := cephCluster.Spec.DisruptionManagement.PGHealthyRegex
-	return r.reconcilePDBsForOSDs(clusterInfo, request, pdbStateMap, poolFailureDomain, allFailureDomains, osdDownFailureDomains, nodeDrainFailureDomains, downOSDs, pgHealthyRegex)
+	return r.reconcilePDBsForOSDs(clusterInfo, request, pdbStateMap, groups, pgHealthyRegex)
 }
 
 // ClusterMap maintains the association between namespace and clusername
